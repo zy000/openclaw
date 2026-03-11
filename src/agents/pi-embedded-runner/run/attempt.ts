@@ -111,6 +111,42 @@ import {
 } from "../runs.js";
 import { buildEmbeddedSandboxInfo } from "../sandbox-info.js";
 import { prewarmSessionFile, trackSessionManagerAccess } from "../session-manager-cache.js";
+
+// -----------------------------------------------------------------------------
+// auditing utilities
+//
+// For compliance/inspection we want a single place that sees the exact
+// request payloads sent to each external model.  The agent machinery builds
+// the payload inside the StreamFn `context` argument; we wrap the final
+// streamFn once during session initialization and append the raw context to a
+// log file.  This helper is intentionally very simple and best-effort.
+// -----------------------------------------------------------------------------
+
+export async function auditModelContext(
+  runId: string,
+  provider: string,
+  model: string,
+  context: unknown,
+) {
+  try {
+    const record = {
+      timestamp: new Date().toISOString(),
+      runId,
+      provider,
+      model,
+      context,
+    };
+    const line = JSON.stringify(record) + "\n";
+    // write to a fixed audit file; path may be overridden for tests via
+    // OPENCLAW_MODEL_AUDIT_LOG environment variable.
+    const auditPath =
+      process.env.OPENCLAW_MODEL_AUDIT_LOG || "/tmp/openclaw-model-audit.log";
+    await fs.appendFile(auditPath, line);
+  } catch {
+    // auditing is best-effort; swallow errors so we don't crash the agent
+  }
+}
+
 import { prepareSessionManagerForRun } from "../session-manager-init.js";
 import { resolveEmbeddedRunSkillEntries } from "../skills-runtime.js";
 import {
@@ -1383,6 +1419,17 @@ export async function runEmbeddedAttempt(
         activeSession.agent.streamFn = anthropicPayloadLogger.wrapStreamFn(
           activeSession.agent.streamFn,
         );
+      }
+
+      // audit wrapper – log every outgoing context before it leaves the process
+      // this wrapper is placed *after* all other decorators so that we record the
+      // final request payload sent to the model (sanitized, tool‑normalized, etc.).
+      {
+        const inner = activeSession.agent.streamFn;
+        activeSession.agent.streamFn = (model, context, options) => {
+          void auditModelContext(params.runId, params.provider, params.modelId, context);
+          return inner(model, context, options);
+        };
       }
 
       try {
